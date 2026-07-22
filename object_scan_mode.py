@@ -25,22 +25,6 @@ data_path = './input_data'
 output_dir = './Pi3_Outputs'
 
 # ==========================================
-# TERRITORY LOCK SETTINGS (the anti-distortion gate)
-# ==========================================
-# Any new point landing closer than this to already-scanned surface
-# is considered "already covered" and is REJECTED. It can never push,
-# thicken, or distort the existing wall. (meters, in model scale)
-COVERAGE_RADIUS = 0.02
-
-# If a view contributes less than this fraction of NEW territory,
-# the entire view is deleted as useless and never used.
-MIN_NOVEL_RATIO = 0.10
-
-# If ICP alignment quality (fitness) is below this, the view is
-# untrustworthy -> deleted instead of smearing the scan.
-MIN_ICP_FITNESS = 0.30
-
-# ==========================================
 # 2. PLANAR PROJECTION (THE "SURFACE IRON")
 # ==========================================
 def apply_planar_projection(points_np, colors_np=None, k_neighbors=30, iterations=2):
@@ -49,25 +33,26 @@ def apply_planar_projection(points_np, colors_np=None, k_neighbors=30, iteration
     high-frequency bumps (elevations) for perfect Poisson reconstruction.
     """
     points = np.copy(points_np.astype(np.float64))
-
+    num_points = len(points)
+    
     for it in range(iterations):
         print(f"  -> Ironing surface bumps: Iteration {it + 1}/{iterations}...")
-
+        
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points)
         pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=k_neighbors))
         normals = np.asarray(pcd.normals)
-
+        
         tree = cKDTree(points)
-        _, idx = tree.query(points, k=k_neighbors)
-
+        _, idx = tree.query(points, k=k_neighbors) 
+        
         neighbors = points[idx]
         centroids = np.mean(neighbors, axis=1)
         vector_to_point = points - centroids
-
+        
         distance_to_plane = np.sum(vector_to_point * normals, axis=1)
         points = points - (distance_to_plane[:, np.newaxis] * normals)
-
+        
     return points, colors_np
 
 # ==========================================
@@ -95,7 +80,7 @@ print(f'Sampling interval: {interval}')
 device = torch.device(device_name)
 conditions = dict(intrinsics=None, poses=None, depths=None)
 
-imgs, conditions = load_multimodal_data(data_path, conditions, interval=interval, device=device)
+imgs, conditions = load_multimodal_data(data_path, conditions, interval=interval, device=device) 
 use_multimodal = any(v is not None for v in conditions.values())
 if not use_multimodal:
     print("No multimodal conditions found.")
@@ -127,7 +112,7 @@ non_edge = ~depth_edge(res['local_points'][..., 2], rtol=0.03)
 masks = torch.logical_and(masks, non_edge)[0]
 
 # ==========================================
-# 5. PER-VIEW EXTRACTION
+# 5. ICP ALIGNMENT
 # ==========================================
 num_views = res['points'][0].shape[0]
 pcds = []
@@ -137,107 +122,45 @@ for v in range(num_views):
     view_mask = masks[v]
     v_points = res['points'][0, v][view_mask].cpu().numpy()
     v_colors = imgs[0, v].permute(1, 2, 0)[view_mask].cpu().numpy()
-
+    
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(v_points.astype(np.float64))
     pcd.colors = o3d.utility.Vector3dVector(v_colors.astype(np.float64))
-
+    
     pcd = pcd.voxel_down_sample(voxel_size=0.01)
     pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.05, max_nn=30))
     pcds.append(pcd)
 
-# ==========================================
-# 6. FIRST-SCAN-WINS FUSION (TERRITORY LOCK)
-# ==========================================
-# Core rule: the overlap between views is used for ICP ALIGNMENT ONLY.
-# After alignment, any point falling inside already-scanned territory
-# is rejected before it can touch the master cloud. Existing geometry
-# is never pushed, never thickened, never distorted.
-
-print("\nPerforming First-Scan-Wins fusion...")
-
-master_pcd = pcds[0]
-master_points = np.asarray(master_pcd.points)
-master_colors = np.asarray(master_pcd.colors)
-master_normals = np.asarray(master_pcd.normals)
-master_tree = cKDTree(master_points)
-
-kept_views = 1
-deleted_views = []
+print("\nPerforming Point-to-Plane ICP Alignment...")
+target_pcd = pcds[0]
+aligned_pcds = [target_pcd]
 
 for v in range(1, num_views):
     source_pcd = pcds[v]
-
-    # --- Step A: align using FULL overlap (alignment needs the overlap) ---
     reg_p2l = o3d.pipelines.registration.registration_icp(
-        source_pcd, master_pcd, 0.05, np.eye(4),
+        source_pcd, target_pcd, 0.05, np.eye(4),
         o3d.pipelines.registration.TransformationEstimationPointToPlane(),
         o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50)
     )
-
-    if reg_p2l.fitness < MIN_ICP_FITNESS:
-        print(f"  [View {v}] DELETED -> ICP fitness {reg_p2l.fitness:.2f} too low (unreliable alignment).")
-        deleted_views.append(v)
-        continue
-
     source_pcd.transform(reg_p2l.transformation)
+    aligned_pcds.append(source_pcd)
 
-    src_points = np.asarray(source_pcd.points)
-    src_colors = np.asarray(source_pcd.colors)
-    src_normals = np.asarray(source_pcd.normals)
-
-    # --- Step B: the territory gate ---
-    # Distance of every new point to the nearest already-scanned point.
-    dist, _ = master_tree.query(src_points, k=1, workers=-1)
-    novel_mask = dist > COVERAGE_RADIUS
-    novel_ratio = float(novel_mask.mean()) if len(novel_mask) > 0 else 0.0
-
-    # --- Step C: delete useless angles entirely ---
-    if novel_ratio < MIN_NOVEL_RATIO:
-        print(f"  [View {v}] DELETED -> only {novel_ratio*100:.1f}% new territory (already scanned).")
-        deleted_views.append(v)
-        continue
-
-    # --- Step D: accept ONLY the points in empty space ---
-    new_points = src_points[novel_mask]
-    new_colors = src_colors[novel_mask]
-    new_normals = src_normals[novel_mask]
-
-    master_points = np.vstack([master_points, new_points])
-    master_colors = np.vstack([master_colors, new_colors])
-    master_normals = np.vstack([master_normals, new_normals])
-
-    # Rebuild master cloud + tree so the next view aligns against
-    # the full accumulated territory (better than aligning to view 0 only).
-    master_pcd = o3d.geometry.PointCloud()
-    master_pcd.points = o3d.utility.Vector3dVector(master_points)
-    master_pcd.colors = o3d.utility.Vector3dVector(master_colors)
-    master_pcd.normals = o3d.utility.Vector3dVector(master_normals)
-    master_tree = cKDTree(master_points)
-
-    kept_views += 1
-    print(f"  [View {v}] KEPT -> fitness {reg_p2l.fitness:.2f}, "
-          f"{novel_ratio*100:.1f}% new territory, +{len(new_points)} points.")
-
-print(f"\nFusion summary: {kept_views}/{num_views} views used, "
-      f"{len(deleted_views)} deleted: {deleted_views}")
-
-final_pcd = master_pcd
+final_pcd = o3d.geometry.PointCloud()
+for p in aligned_pcds:
+    final_pcd += p
 
 # ==========================================
-# 7. THE PERFECT CLEANUP PIPELINE
+# 6. THE PERFECT CLEANUP PIPELINE
 # ==========================================
-# A. Light uniformity pass (double walls no longer exist thanks to the
-#    territory lock, so this is just for even point spacing).
-print("\nUniformizing point spacing...")
-final_pcd = final_pcd.voxel_down_sample(voxel_size=0.01)
+# A. Kill the last 4% double wall by merging closely overlapping points
+print("\nFusing aligned mesh layers...")
+final_pcd = final_pcd.voxel_down_sample(voxel_size=0.015)
 
-# B. Statistical cleanup to destroy any leftover ghosting floaters
+# B. Aggressive Statistical Cleanup to destroy ghosting floaters
 print("Executing Statistical Outlier Removal to destroy ghosting...")
 final_pcd, _ = final_pcd.remove_statistical_outlier(nb_neighbors=25, std_ratio=1.5)
 
 # C. Iron out the tiny elevations for a silky smooth surface
-#    (now mostly polishing the seams between view patches)
 clean_points = np.asarray(final_pcd.points)
 clean_colors = np.asarray(final_pcd.colors)
 
